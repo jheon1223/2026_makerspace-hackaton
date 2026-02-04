@@ -58,6 +58,9 @@ State st = ST_INIT;
 // gate를 DO_MOVE 끝에서 어떤 상태로 둘지
 bool pendingGateOpen = false;
 
+// ⭐ “진짜 첫 ZERO”인지 여부
+bool firstZeroDone = false;
+
 // =========================================================
 // Helpers
 // =========================================================
@@ -164,6 +167,14 @@ bool handlePiCommand(const String &line) {
     delay(30);
     sendMoveComplete();
 
+    // 진짜 "첫 ZERO" 때만 추가로 1칸 더 이동 + move_complete
+    if (!firstZeroDone) {
+      moveOneCell();
+      delay(30);
+      sendMoveComplete();
+      firstZeroDone = true;
+    }
+
     // 이후는 라파 명령 대기 상태로
     st = ST_WAIT_PI_CMD;
     return true;
@@ -191,7 +202,8 @@ void setup() {
   pinMode(PIN_DIR, OUTPUT);
   pinMode(PIN_STEP, OUTPUT);
   pinMode(PIN_EN, OUTPUT);
-
+  digitalWrite(PIN_STEP, LOW);
+  digitalWrite(PIN_EN, HIGH);
   stepperEnable(true);
 
   gateNormal.attach(PIN_GATE_NORMAL);
@@ -203,6 +215,7 @@ void setup() {
 
   cell_err_acc = 0;
   pendingGateOpen = false;
+  firstZeroDone = false;
 
 #if MANUAL_HOME
   st = ST_HOME_WAIT;
