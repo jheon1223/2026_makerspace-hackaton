@@ -160,17 +160,18 @@ bool handlePiCommand(const String &line) {
     // 누적 오차 리셋
     cell_err_acc = 0;
 
-    // ⭐⭐⭐ 진짜 "첫 ZERO" 때만: 2칸 이동 + move_complete 송신
+    // ZERO 이후에는 무조건: 게이트 닫고 1칸 이동 + move_complete
+    gateNormal.write(NOR_CLOSE);
+
+    moveOneCell();
+    delay(30);
+    sendMoveComplete();
+
+    // 진짜 "첫 ZERO" 때만 추가로 1칸 더 이동 + move_complete
     if (!firstZeroDone) {
-      // 게이트는 안전하게 닫아두고
-      gateNormal.write(NOR_CLOSE);
-
       moveOneCell();
       delay(30);
-      moveOneCell();
-      delay(30);
-
-      sendMoveComplete();     // “초기 2칸 이동 끝남” 신호
+      sendMoveComplete();
       firstZeroDone = true;
     }
 
@@ -260,18 +261,24 @@ void loop() {
       break;
 
     case ST_DO_MOVE:
+      // 1) 게이트를 먼저 세팅 (open/close)
+      gateNormal.write(pendingGateOpen ? NOR_OPEN : NOR_CLOSE);
+      delay(30); // 서보가 각도에 도달할 시간(필요시 50~150ms로 조절)
+
+      // 2) 롤러 회전
       rollersStart(FEED_SPEED);
       delay(T_ROLL_MS);
       rollersStop();
       delay(T_FEED_SETTLE_MS);
 
+      // 3) 스텝모터 1칸 이동
       moveOneCell();
 
-      gateNormal.write(pendingGateOpen ? NOR_OPEN : NOR_CLOSE);
-
+      // 4) 완료 알림
       sendMoveComplete();
       st = ST_WAIT_PI_CMD;
       break;
+
 
     case ST_ERROR:
       stepperEnable(false);
