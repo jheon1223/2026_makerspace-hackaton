@@ -5,7 +5,7 @@
 //  - DEBUG=1 : print debug logs
 //  - DEBUG=0 : no debug logs (protocol CAP/RES still works)
 // =========================================================
-#define DEBUG 1
+#define DEBUG 0
 
 #if DEBUG
   #define DPRINT(x)   do { Serial.print("DBG "); Serial.print(x); } while(0)
@@ -51,17 +51,15 @@ const int NOR_OPEN  = 70;
 // -------------------- Timing --------------------
 const unsigned long T_ROLL_MS           = 250;   // 롤러로 원두 밀어넣는 시간
 const unsigned long T_FEED_SETTLE_MS    = 200;    // stop 후 안정화
-const unsigned long T_NOR_OPEN_MS       = 200;   // 정상 배출 게이트 열어두는 시간
 const unsigned long WAIT_RES_TIMEOUT_MS = 8000;  // 라파 응답 타임아웃
 
-// -------------------- Slot / Index --------------------
+// -------------------- Slot / Pos --------------------
 const int N_SLOTS = 24;
-
-// "pos"는 물리적으로 고정된 위치(0~23), head로 배열 매핑
-const int CAPTURE_POS       = 2;
+const int CAPTURE_POS       = 2; // 라파가 촬영하는 위치(물리 pos)
 const int NORMAL_EJECT_POS  = 8;
 const int DEFECT_EJECT_POS  = 11;
 
+// -------------------- Direction --------------------
 const bool DIR_FORWARD = true; // true면 정방향
 
 // -------------------- Stepper Config --------------------
@@ -70,32 +68,24 @@ const int  STEPS_CELL_BASE  = STEPS_PER_REV / N_SLOTS; // 133
 const int  STEPS_CELL_REM   = STEPS_PER_REV % N_SLOTS; // 8
 int cell_err_acc = 0;
 
-// -------------------- Bean tracking --------------------
-// state: -1 empty, 3 entered, 2 capture requested(wait), 1 normal, 0 defect
-int   beanId[N_SLOTS];
-int8_t beanState[N_SLOTS];
-
-// head: "물리 pos=0"이 배열에서 어디를 가리키는가
+// -------------------- Logical head --------------------
+// head: "물리 pos=0"이 배열에서 어디를 가리키는가 (HOME/ZERO 정렬용)
 int head = 0;
 
-// 증가하는 생두 고유 ID
-int nextBeanId = 0;
-
-// 캡처 대기 중인 bean_id
-int waitingBeanId = -1;
+// -------------------- simple bean id for CAP only --------------------
+int nextBeanId = 0;       // CAP 보낼 때만 증가
+int waitingBeanId = -1;   // camera_done_* 기다리는 동안만 사용
 
 // -------------------- FSM State --------------------
 enum State {
   ST_HOME_WAIT,
   ST_INIT,
-  ST_FEED_ROLL_START,
-  ST_FEED_ROLL_WAIT,
-  ST_STEP_ONE_CELL,
+
+  // CAP 요청 -> 라파 응답 대기 -> 움직임 -> 완료 통지
   ST_CHECK_CAPTURE,
   ST_WAIT_RESULT,
-  ST_CHECK_EJECT,
-  ST_NORMAL_EJECT_OPEN,
-  ST_NORMAL_EJECT_CLOSE_WAIT,
+  ST_DO_MOVE,
+
   ST_ERROR
 };
 
@@ -105,25 +95,8 @@ unsigned long t0 = 0;
 // =========================================================
 // Helpers
 // =========================================================
-inline int slotIndexFromPos(int pos) {
-  // pos: 물리 위치(0~23)
-  // head: 물리 pos0가 배열에서 head를 가리킴
-  int idx = head + pos;
-  idx %= N_SLOTS;
-  return idx;
-}
-
-void initSlots() {
-  for (int i = 0; i < N_SLOTS; i++) {
-    beanId[i] = -1;
-    beanState[i] = -1;
-  }
-  waitingBeanId = -1;
-}
-
 void stepperEnable(bool en) {
-  // DRV8825: EN low = enable
-  digitalWrite(PIN_EN, en ? LOW : HIGH);
+  digitalWrite(PIN_EN, en ? LOW : HIGH); // DRV8825: EN low = enable
 }
 
 void stepPulse(int delayUs) {
@@ -151,12 +124,9 @@ void moveOneCell() {
   digitalWrite(PIN_DIR, DIR_FORWARD ? HIGH : LOW);
   moveMicrosteps(steps);
 
-  // 한 칸 이동했으니 head만 전진
-  if (DIR_FORWARD) {
-    head = (head + N_SLOTS - 1) % N_SLOTS; // head--
-  } else {
-    head = (head + 1) % N_SLOTS;           // head++
-  }
+  // head 갱신
+  if (DIR_FORWARD) head = (head + N_SLOTS - 1) % N_SLOTS;
+  else             head = (head + 1) % N_SLOTS;
 }
 
 void rollersStart(int speed) {
@@ -174,42 +144,6 @@ void rollersStop() {
   rollerB.write(STOP_360);
 }
 
-// =========================================================
-// Protocol
-//  Arduino -> RPi: "CAP <bean_id> <pos>\n"
-//  RPi -> Arduino: "RES <bean_id> <cls>\n"
-// =========================================================
-void sendCaptureRequest(int bean_id, int pos) {
-  // 프로토콜은 DEBUG와 무관하게 항상 출력
-  Serial.print("CAP ");
-  Serial.print(bean_id);
-  Serial.print(" ");
-  Serial.print(pos);
-  Serial.print("\n");
-
-  DPRINT("[TX] CAP bean_id=");
-  DPRINT(bean_id);
-  DPRINT(" pos=");
-  DPRINTLN(pos);
-}
-
-// RES 파싱: "RES <bean_id> <cls>"
-bool parseResLine(const String &line, int &bean_id, int &cls) {
-  if (!line.startsWith("RES ")) return false;
-
-  int p1 = line.indexOf(' ');
-  int p2 = line.indexOf(' ', p1 + 1);
-  if (p1 < 0 || p2 < 0) return false;
-
-  bean_id = line.substring(p1 + 1, p2).toInt();
-  cls = line.substring(p2 + 1).toInt();
-
-  if (bean_id <= 0) return false;
-  if (!(cls == 0 || cls == 1)) return false;
-
-  return true;
-}
-
 bool readLine(String &out) {
   if (!Serial.available()) return false;
   out = Serial.readStringUntil('\n');
@@ -218,13 +152,29 @@ bool readLine(String &out) {
 }
 
 // =========================================================
-// Find bean_id in slots
+// Protocol
+//  RPi -> Arduino: "camera_done_open\n" or "camera_done_close\n"
+//  Arduino -> RPi: "move_complete\n"
 // =========================================================
-int findBeanIndexById(int bean_id) {
-  for (int i = 0; i < N_SLOTS; i++) {
-    if (beanId[i] == bean_id) return i;
-  }
-  return -1;
+void sendCaptureRequest(int bean_id, int pos) {
+  Serial.print("CAP ");
+  Serial.print(bean_id);
+  Serial.print(" ");
+  Serial.print(pos);
+  Serial.print("\n");
+}
+
+void sendMoveComplete() {
+  Serial.print("move_complete\n");
+}
+
+// camera_done_* 파싱
+// open  => gate open (NOR_OPEN)
+// close => gate close (NOR_CLOSE)
+bool parseCameraDone(const String &line, bool &gateOpen) {
+  if (line == "camera_done_open")  { gateOpen = true;  return true; }
+  if (line == "camera_done_close") { gateOpen = false; return true; }
+  return false;
 }
 
 // =========================================================
@@ -254,7 +204,6 @@ void handleHomeJog(const String &cmd) {
   DPRINTLN(jog);
 }
 
-// 라파 명령 처리 (처리했으면 true)
 bool handlePiCommand(const String &line) {
   if (line == "HELP") {
     printHomeHelp();
@@ -275,7 +224,7 @@ bool handlePiCommand(const String &line) {
       return true;
     }
 
-    // microstep grid align (선택: 안정적으로 하기 위함)
+    // microstep grid align (선택: 안정적으로 하기 위함) //이거 빼도 되는지 확인하기
     
     digitalWrite(PIN_DIR, DIR_FORWARD ? HIGH : LOW);
     moveMicrosteps(STEPS_CELL_BASE);
@@ -285,7 +234,6 @@ bool handlePiCommand(const String &line) {
     // 논리 상태 초기화
     head = 0;
     cell_err_acc = 0;
-    initSlots();
     waitingBeanId = -1;
 
     DPRINTLN("[PI] ZERO -> aligned, start FSM");
@@ -325,10 +273,10 @@ void setup() {
   gateNormal.write(NOR_CLOSE);
   rollersStop();
 
-  initSlots();
   head = 0;
   nextBeanId = 0;
   cell_err_acc = 0;
+  waitingBeanId = -1;
 
 #if MANUAL_HOME
   st = ST_HOME_WAIT;
@@ -349,25 +297,21 @@ void loop() {
     // 라파 HOME/JOG/ZERO 먼저 처리 -> 처리되면 이번 loop는 FSM 진행하지 않음(안전)
     if (handlePiCommand(line)) return;
 
-    // RES 처리
-    int rid, rcls;
-    if (parseResLine(line, rid, rcls)) {
-      int idx = findBeanIndexById(rid);
-      if (idx >= 0) {
-        beanState[idx] = (int8_t)rcls;
-        DPRINT("[RX] RES bean_id=");
-        DPRINT(rid);
-        DPRINT(" cls=");
-        DPRINTLN(rcls);
+    // camera_done_* 처리
+    bool gateOpen;
+    if (parseCameraDone(line, gateOpen)) {
+      if (st == ST_WAIT_RESULT && waitingBeanId != -1) {
+        // 라파가 판독 끝났으니, 결과에 따라 "이번 동작 끝에서" 게이트를 열지/닫을지 결정
+        // gateOpen: true면 열기, false면 닫기
+        gateNormal.write(gateOpen ? NOR_OPEN : NOR_CLOSE);
 
-        // 기다리던 bean이면 waiting 해제
-        if (waitingBeanId == rid) {
-          waitingBeanId = -1;
-        }
-      } else {
-        DPRINT("[RX] RES for unknown bean_id=");
-        DPRINTLN(rid);
+        DPRINT("[RX] camera_done_");
+        DPRINTLN(gateOpen ? "open" : "close");
+
+        waitingBeanId = -1; // 응답 수신 완료
+        st = ST_DO_MOVE;    // 이제 움직임 수행
       }
+      return;
     }
   }
 
@@ -378,157 +322,44 @@ void loop() {
       break;
 
     case ST_INIT:
-      DPRINTLN("[STATE] INIT -> FEED");
-      st = ST_FEED_ROLL_START;
-      break;
-
-    case ST_FEED_ROLL_START:
-      rollersStart(FEED_SPEED);
-      t0 = millis();
-      st = ST_FEED_ROLL_WAIT;
-      break;
-
-    case ST_FEED_ROLL_WAIT:
-      if (millis() - t0 >= T_ROLL_MS) {
-        rollersStop();
-        t0 = millis();
-
-        // feed 완료 -> pos0에 새 원두 등록
-        int i0 = slotIndexFromPos(0);
-        if (beanState[i0] != -1) {
-          // pos0이 비어있지 않으면 논리/기구 문제
-          DPRINTLN("[ERR] pos0 not empty when feeding!");
-          st = ST_ERROR;
-          break;
-        }
-
-        int newId = ++nextBeanId;
-        beanId[i0] = newId;
-        beanState[i0] = 3; // entered
-        DPRINT("[FEED] new bean_id=");
-        DPRINTLN(newId);
-
-        st = ST_STEP_ONE_CELL;
-      }
-      break;
-
-    case ST_STEP_ONE_CELL:
-      if (millis() - t0 >= T_FEED_SETTLE_MS) {
-        moveOneCell();
-        // 이동했으니 바로 캡처 체크
-        st = ST_CHECK_CAPTURE;
-      }
+      st = ST_FEED_ROLL_START; //처음 두 칸은 돌아야됨.
       break;
 
     case ST_CHECK_CAPTURE: {
-      int ic = slotIndexFromPos(CAPTURE_POS);
-
-      if (beanState[ic] == 3 && beanId[ic] > 0) {
-        int bid = beanId[ic];
-
-    #if DEBUG
-        // 🔥 DEBUG 모드: 바로 정상(또는 원하는 값)으로 처리
-        beanState[ic] = 1;   // 1 = normal (0으로 하면 defect)
-        waitingBeanId = -1;
-        DPRINTLN("[DEBUG] skip CAP/RES, auto NORMAL");
-        st = ST_CHECK_EJECT;
-    #else
-        beanState[ic] = 2;   // capture requested
-        waitingBeanId = bid;
-        sendCaptureRequest(bid, CAPTURE_POS);
-        t0 = millis();
-        st = ST_WAIT_RESULT;
-    #endif
-
-      } else {
-        st = ST_CHECK_EJECT;
-      }
-      break;
-    }
-
-
-    case ST_WAIT_RESULT: {
-      // waitingBeanId가 -1이 되면(RES 받음) 종료
-      if (waitingBeanId == -1) {
-        DPRINTLN("[STATE] RES received -> CHECK_EJECT");
-        st = ST_CHECK_EJECT;
-      } else if (millis() - t0 >= WAIT_RES_TIMEOUT_MS) {
-        // 타임아웃이면 해당 bean_id를 defect(0)로 처리
-        int idx = findBeanIndexById(waitingBeanId);
-        if (idx >= 0) {
-          beanState[idx] = 0; // defect
-          DPRINT("[WARN] RES timeout -> set DEFECT bean_id=");
-          DPRINTLN(waitingBeanId);
-        }
-        waitingBeanId = -1;
-        st = ST_CHECK_EJECT;
-      }
-      break;
-    }
-
-    case ST_CHECK_EJECT: {
-      int in = slotIndexFromPos(NORMAL_EJECT_POS);
-      int idn = beanId[in];
-      int8_t sn = beanState[in];
-
-      // 정상 배출 위치: state==1이면 gate 열기
-      if (sn == 1 && idn > 0) {
-        DPRINT("[EJECT] NORMAL bean_id=");
-        DPRINTLN(idn);
-        st = ST_NORMAL_EJECT_OPEN;
-        break;
-      } else {
-        // 정상 아니면 gate 닫아두기
-        gateNormal.write(NOR_CLOSE);
-      }
-
-      // 결점 배출 위치: 뭔가 있으면(0 포함, 혹은 정상도 실수로 오면) 드랍 처리
-      int id = slotIndexFromPos(DEFECT_EJECT_POS);
-      int bid = beanId[id];
-      int8_t sd = beanState[id];
-
-      if (sd != -1 && bid > 0) {
-        // 여기선 servo 없이 그냥 떨어지는 구조라고 가정 -> 상태 clear
-        if (sd == 1) {
-          DPRINT("[WARN] NORMAL reached DEFECT eject! bean_id=");
-          DPRINTLN(bid);
-        } else {
-          DPRINT("[EJECT] DEFECT drop bean_id=");
-          DPRINTLN(bid);
-        }
-
-        beanId[id] = -1;
-        beanState[id] = -1;
-      }
-
-      // 다음 사이클로
-      st = ST_FEED_ROLL_START;
-      break;
-    }
-
-    case ST_NORMAL_EJECT_OPEN: {
-      gateNormal.write(NOR_OPEN);
+      // 여기서는 “촬영 위치에 원두가 왔다”라고 가정하고,
+      // 라파가 사진 찍고 판독할 수 있도록 CAP을 보내고 멈춰서 기다림
+      int bid = ++nextBeanId;
+      waitingBeanId = bid;
+      sendCaptureRequest(bid, CAPTURE_POS);
       t0 = millis();
-      st = ST_NORMAL_EJECT_CLOSE_WAIT;
+      st = ST_WAIT_RESULT;
       break;
     }
 
-    case ST_NORMAL_EJECT_CLOSE_WAIT: {
-      if (millis() - t0 >= T_NOR_OPEN_MS) {
+    case ST_WAIT_RESULT:
+      // camera_done_* 올 때까지 대기 (timeout 시 안전하게 close 처리 후 진행)
+      if (waitingBeanId == -1) {
+        // 이미 camera_done_*를 받아서 ST_DO_MOVE로 넘어가도록 위에서 처리됨
+      } else if (millis() - t0 >= WAIT_RES_TIMEOUT_MS) {
+        // 타임아웃이면 안전하게 close로 처리하고 움직임 진행
         gateNormal.write(NOR_CLOSE);
-
-        // 정상 배출 위치 슬롯 비우기
-        int in = slotIndexFromPos(NORMAL_EJECT_POS);
-        DPRINT("[EJECT] NORMAL cleared pos=");
-        DPRINTLN(NORMAL_EJECT_POS);
-
-        beanId[in] = -1;
-        beanState[in] = -1;
-
-        st = ST_FEED_ROLL_START;
+        waitingBeanId = -1;
+        st = ST_DO_MOVE;
       }
       break;
-    }
+
+    case ST_DO_MOVE:
+      // 요구한 움직임: (롤러 2개 돌리기 -> 스텝모터 한 칸 -> 게이트는 (이미 open/close로 세팅됨))
+      rollersStart(FEED_SPEED);
+      delay(T_ROLL_MS);
+      rollersStop();
+      delay(T_FEED_SETTLE_MS);
+
+      moveOneCell();
+      sendMoveComplete(); // 모든 움직임 끝
+      st = ST_CHECK_CAPTURE;
+      break;
+
 
     case ST_ERROR:
       DPRINTLN("[ERROR] halted");
