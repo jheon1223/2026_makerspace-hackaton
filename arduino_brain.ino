@@ -2,10 +2,8 @@
 
 #define DEBUG 0
 #if DEBUG
-  #define DPRINT(x)   do { Serial.print("DBG "); Serial.print(x); } while(0)
   #define DPRINTLN(x) do { Serial.print("DBG "); Serial.println(x); } while(0)
 #else
-  #define DPRINT(x)   do {} while(0)
   #define DPRINTLN(x) do {} while(0)
 #endif
 
@@ -31,15 +29,14 @@ Servo rollerB;
 const int STOP_360   = 90;
 const int FEED_SPEED = 8;
 
-const int NOR_CLOSE = 0;
-const int NOR_OPEN  = 70;
+const int NOR_CLOSE = 80;
+const int NOR_OPEN  = 200;
 
 const unsigned long T_ROLL_MS        = 250;
 const unsigned long T_FEED_SETTLE_MS = 200;
 
 const int  N_SLOTS = 24;
 const bool DIR_FORWARD = true;
-
 const long STEPS_PER_REV    = 3200;
 const int  STEPS_CELL_BASE  = STEPS_PER_REV / N_SLOTS; // 133
 const int  STEPS_CELL_REM   = STEPS_PER_REV % N_SLOTS; // 8
@@ -57,9 +54,6 @@ State st = ST_INIT;
 
 // gate를 DO_MOVE 끝에서 어떤 상태로 둘지
 bool pendingGateOpen = false;
-
-// ⭐ “진짜 첫 ZERO”인지 여부
-bool firstZeroDone = false;
 
 // =========================================================
 // Helpers
@@ -112,7 +106,7 @@ void sendMoveComplete() {
 }
 
 // =========================================================
-// Home commands (유지)
+// Home commands
 // =========================================================
 void printHomeHelp() {
   DPRINTLN("=== HOME MODE (from RPi) ===");
@@ -147,15 +141,15 @@ bool handlePiCommand(const String &line) {
     st = ST_HOME_WAIT;
     return true;
   }
+   if (line == "OPEN") {
+    gateNormal.write(NOR_OPEN);
+  }
+  if (line == "CLOSE") {
+    gateNormal.write(NOR_CLOSE);
+  }
 
   if (line == "ZERO") {
     if (st != ST_HOME_WAIT) return true;
-
-    // microstep grid align (기존 유지)
-    digitalWrite(PIN_DIR, DIR_FORWARD ? HIGH : LOW);
-    moveMicrosteps(STEPS_CELL_BASE);
-    digitalWrite(PIN_DIR, !DIR_FORWARD ? HIGH : LOW);
-    moveMicrosteps(STEPS_CELL_BASE);
 
     // 누적 오차 리셋
     cell_err_acc = 0;
@@ -166,14 +160,6 @@ bool handlePiCommand(const String &line) {
     moveOneCell();
     delay(30);
     sendMoveComplete();
-
-    // 진짜 "첫 ZERO" 때만 추가로 1칸 더 이동 + move_complete
-    if (!firstZeroDone) {
-      moveOneCell();
-      delay(30);
-      sendMoveComplete();
-      firstZeroDone = true;
-    }
 
     // 이후는 라파 명령 대기 상태로
     st = ST_WAIT_PI_CMD;
@@ -202,8 +188,11 @@ void setup() {
   pinMode(PIN_DIR, OUTPUT);
   pinMode(PIN_STEP, OUTPUT);
   pinMode(PIN_EN, OUTPUT);
+  
   digitalWrite(PIN_STEP, LOW);
   digitalWrite(PIN_EN, HIGH);
+  digitalWrite(PIN_DIR, HIGH);
+
   stepperEnable(true);
 
   gateNormal.attach(PIN_GATE_NORMAL);
@@ -215,7 +204,6 @@ void setup() {
 
   cell_err_acc = 0;
   pendingGateOpen = false;
-  firstZeroDone = false;
 
 #if MANUAL_HOME
   st = ST_HOME_WAIT;
